@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"/>
+<title>Live Draw.io Preview</title>
+<style>
+:root{
+  --bg: #ffffff;
+  --text: #333333;
+  --font: -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+}
+html,body{
+  padding:0;
+  margin: 0;
+  height:100%;
+  background:var(--bg);
+  color:var(--text);
+  font-family:var(--font);
+  font-size:14px;
+  display:flex;
+  flex-direction:column;
+  overflow: hidden; /* 防止双重滚动条 */
+}
+main{
+  flex:1;
+  position: relative;
+  width: 100%;
+  height: 100%;
+  background-color: #f0f0f0;
+}
+#preview-frame{
+  width: 100%;
+  height: 100%;
+  border: none;
+  display: block;
+}
+#empty{
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  height: 100%;
+  display:flex;
+  flex-direction: column;
+  align-items:center;
+  justify-content:center;
+  color: #999;
+  background: white;
+  z-index: 10;
+}
+#loading-indicator {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  background: rgba(0, 123, 255, 0.9);
+  color: white;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 12px;
+  z-index: 100;
+  display: none;
+  pointer-events: none;
+}
+.icon-drawio {
+  width: 64px;
+  height: 64px;
+  margin-bottom: 16px;
+  opacity: 0.5;
+}
+</style>
+</head>
+<body>
+
+<main id="container">
+  <div id="loading-indicator">Rendering...</div>
+  
+  <div id="empty">
+    <svg class="icon-drawio" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path>
+    </svg>
+    <div>Waiting for Draw.io XML data...</div>
+  </div>
+
+  <!-- Draw.io 嵌入式 Iframe -->
+  <!-- 
+       参数说明:
+       embed=1: 嵌入模式
+       ui=min: 最小化UI (适合侧边栏，但为了编辑功能，我们允许显示部分工具栏)
+       spin=1: 加载时显示旋转
+       modify=1: 允许编辑
+       proto=json: 使用JSON协议通信
+       gapi=0: 禁用Google集成(加快加载)
+       noSaveBtn=1: 隐藏保存按钮(我们主要做预览和导出)
+  -->
+  <iframe id="preview-frame" style="display:none;"></iframe>
+</main>
+<script>
+/* ========== 配置与状态 ========== */
+const iframe = document.getElementById('preview-frame');
+const emptyDiv = document.getElementById('empty');
+const loadingIndicator = document.getElementById('loading-indicator');
+let currentXml = '';
+let renderTimer = null;
+let isIframeReady = false;
+
+// 初始化 URL
+const drawioUrl = 'https://embed.diagrams.net/?embed=1&ui=atlas&spin=1&modify=1&proto=json&noSaveBtn=1&libraries=1';
+
+/* ========== 核心: XML 清洗与修复 ========== */
+
+/**
+ * 修复 AI 生成的烂 XML
+ * 1. 移除没有 'as' 属性的 mxPoint (这是导致报错的核心原因)
+ * 2. 修复非法的数字属性 (如 height="X100" -> height="100")
+ */
+function sanitizeDrawioXml(xmlStr) {
+  try {
+    const parser = new DOMParser();
+    const doc = parser.parseFromString(xmlStr, "application/xml");
+    
+    // 检查解析错误
+    if (doc.querySelector('parsererror')) {
+      return xmlStr; // 无法解析，原样返回，让后续流程处理
+    }
+
+    // --- 修复 1: 移除会导致 "Could not add object mxPoint" 的节点 ---
+    // 查找所有在 mxGeometry 下且没有 as 属性的 mxPoint
+    const badPoints = doc.querySelectorAll('mxGeometry > mxPoint:not([as])');
+    badPoints.forEach(el => {
+      // 移除这些坏点，让 Draw.io 自动计算连线
+      el.parentNode.removeChild(el);
+    });
+
+    // --- 修复 2: 清理非数字的尺寸属性 (可选优化) ---
+    // AI 经常输出 "X100", "1X0" 等
+    const geometryNodes = doc.querySelectorAll('mxGeometry');
+    ['width', 'height', 'x', 'y'].forEach(attr => {
+      geometryNodes.forEach(node => {
+        if (node.hasAttribute(attr)) {
+          let val = node.getAttribute(attr);
+          // 如果包含非数字字符，尝试提取数字
+          if (/[^0-9\.\-]/.test(val)) {
+            const num = val.replace(/[^0-9\.\-]/g, '');
+            if (num) {
+              node.setAttribute(attr, num);
+            } else {
+              // 如果完全是乱码，设为默认值防止图形消失
+              node.setAttribute(attr, attr === 'x' || attr === 'y' ? '0' : '80');
+            }
+          }
+        }
+      });
+    });
+
+    // 重新序列化为字符串
+    return new XMLSerializer().serializeToString(doc);
+
+  } catch (e) {
+    console.warn('XML清洗失败:', e);
+    return xmlStr; // 出错时返回原字符串
+  }
+}
+
+/**
+ * 验证 XML 字符串是否合法
+ */
+function isValidXml(xmlStr) {
+  if (!xmlStr || xmlStr.length < 50) return false;
+  if (!xmlStr.includes('<mxGraphModel') && !xmlStr.includes('<mxfile')) return false;
+  
+  // 简单验证闭合，防止流式输出未完成时报错
+  // 检查是否包含 mxfile 或 mxGraphModel 的闭合标签
+  if (!xmlStr.includes('</mxfile>') && !xmlStr.includes('</mxGraphModel>')) {
+     return false;
+  }
+  
+  return true;
+}
+
+/**
+ * 提取 XML
+ */
+function extractDrawioXml(text) {
+  if (!text) return { xml: '', isComplete: false };
+
+  // 1. 寻找 XML 起始
+  const roots = ['mxfile', 'mxGraphModel'];
+  let startIndex = -1;
+  let rootTag = '';
+
+  for (const tag of roots) {
+    const idx = text.indexOf('<' + tag);
+    if (idx !== -1) {
+      if (startIndex === -1 || idx < startIndex) {
+        startIndex = idx;
+        rootTag = tag;
+      }
+    }
+  }
+
+  if (startIndex === -1) return { xml: '', isComplete: false };
+
+  // 2. 寻找 XML 结束
+  let xmlContent = text.substring(startIndex);
+  const endTag = `</${rootTag}>`;
+  const endTagIndex = xmlContent.indexOf(endTag);
+  let isComplete = false;
+
+  if (endTagIndex !== -1) {
+    xmlContent = xmlContent.substring(0, endTagIndex + endTag.length);
+    isComplete = true;
+  }
+
+  // 3. 关键：在这里进行清洗
+  if (isComplete) {
+      xmlContent = sanitizeDrawioXml(xmlContent);
+  }
+
+  return { xml: xmlContent, isComplete: isComplete };
+}
+
+
+/* ========== 渲染逻辑 (保持不变) ========== */
+
+function showLoading(show) {
+  loadingIndicator.style.display = show ? 'block' : 'none';
+}
+
+function initIframe() {
+  if (iframe.src === '' || iframe.src === 'about:blank') {
+    iframe.src = drawioUrl;
+  }
+}
+
+function loadDiagram(xml) {
+  if (!isIframeReady) return;
+  
+  iframe.contentWindow.postMessage(JSON.stringify({
+    action: 'load', 
+    xml: xml,
+    autosave: false 
+  }), '*');
+  
+  emptyDiv.style.display = 'none';
+  iframe.style.display = 'block';
+  showLoading(false);
+}
+
+function debouncedRender(xmlData) {
+  clearTimeout(renderTimer);
+  
+  if (!xmlData.xml) return;
+  if (!isValidXml(xmlData.xml)) {
+    if (xmlData.xml.length > 50) showLoading(true); // 只有内容够长才显示加载中
+    return;
+  }
+  if (xmlData.xml === currentXml) return;
+
+  renderTimer = setTimeout(() => {
+    console.log('执行渲染，XML长度:', xmlData.xml.length);
+    currentXml = xmlData.xml;
+    
+    if (!isIframeReady) {
+      initIframe();
+    } else {
+      loadDiagram(xmlData.xml);
+    }
+  }, 100);
+}
+
+function renderPreview(list) {
+  if (!list || !list.length) return;
+  
+  const assistantMessages = list.filter(m => m.role === 'assistant');
+  if (!assistantMessages.length) return;
+  
+  const lastMessage = assistantMessages[assistantMessages.length - 1];
+  const content = lastMessage.pure_content || lastMessage.content || '';
+  
+  const xmlData = extractDrawioXml(content);
+  
+  if (xmlData.xml) {
+    debouncedRender(xmlData);
+  }
+}
+
+/* ========== WebSocket (保持不变) ========== */
+window.addEventListener('message', function(event) {
+  if (event.source !== iframe.contentWindow) return;
+  try {
+    const msg = JSON.parse(event.data);
+    if (msg.event === 'init') {
+      isIframeReady = true;
+      if (currentXml && isValidXml(currentXml)) loadDiagram(currentXml);
+    }
+  } catch (e) {}
+});
+
+let ws;
+let reconnectAttempts = 0;
+
+function init() {
+  initIframe();
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  ws = new WebSocket(`${proto}//${location.host}/ws`);
+  
+  ws.onopen = () => {
+    reconnectAttempts = 0;
+    ws.send(JSON.stringify({type:'get_messages'}));
+  };
+  
+  ws.onmessage = e => {
+    try {
+      const data = JSON.parse(e.data);
+      if (data.type === 'messages_update' || data.type === 'broadcast_messages') {
+        renderPreview(data.data.messages);
+      }
+    } catch (error) {}
+  };
+  
+  ws.onclose = () => {
+     if (reconnectAttempts++ < 5) setTimeout(init, 1000 * reconnectAttempts);
+  };
+}
+
+init();
+</script>
+</body>
+</html>

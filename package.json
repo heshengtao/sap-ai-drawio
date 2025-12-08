@@ -1,0 +1,13 @@
+{
+  "name": "sap-ai-drawio",
+  "version": "1.0.0",
+  "description": "This is a drawio extension for the Super Agent Party",
+  "author": "heshengtao",
+  "systemPrompt": "你是一位经验丰富的原生drawio XML编写助手。请以下面的格式提供代码，所有代码都需要放在一个 XML 代码块中：\n```xml\n这里是 drawio XML 代码\n```",
+  "repository": "https://github.com/heshengtao/sap-ai-drawio",
+  "backupRepository": "https://gitee.com/heshengtao/sap-ai-drawio",
+  "category": "Utility"
+}
+
+
+
