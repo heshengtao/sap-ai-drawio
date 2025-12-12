@@ -19,7 +19,7 @@ html,body{
   font-size:14px;
   display:flex;
   flex-direction:column;
-  overflow: hidden; /* 防止双重滚动条 */
+  overflow: hidden;
 }
 main{
   flex:1;
@@ -34,20 +34,6 @@ main{
   border: none;
   display: block;
 }
-#empty{
-  position: absolute;
-  top: 0;
-  left: 0;
-  width: 100%;
-  height: 100%;
-  display:flex;
-  flex-direction: column;
-  align-items:center;
-  justify-content:center;
-  color: #999;
-  background: white;
-  z-index: 10;
-}
 #loading-indicator {
   position: absolute;
   top: 10px;
@@ -61,129 +47,92 @@ main{
   display: none;
   pointer-events: none;
 }
-.icon-drawio {
-  width: 64px;
-  height: 64px;
-  margin-bottom: 16px;
-  opacity: 0.5;
-}
 </style>
 </head>
 <body>
 
 <main id="container">
   <div id="loading-indicator">Rendering...</div>
-  
-  <div id="empty">
-    <svg class="icon-drawio" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5"></path>
-    </svg>
-    <div>Waiting for Draw.io XML data...</div>
-  </div>
-
-  <!-- Draw.io 嵌入式 Iframe -->
-  <!-- 
-       参数说明:
-       embed=1: 嵌入模式
-       ui=min: 最小化UI (适合侧边栏，但为了编辑功能，我们允许显示部分工具栏)
-       spin=1: 加载时显示旋转
-       modify=1: 允许编辑
-       proto=json: 使用JSON协议通信
-       gapi=0: 禁用Google集成(加快加载)
-       noSaveBtn=1: 隐藏保存按钮(我们主要做预览和导出)
-  -->
-  <iframe id="preview-frame" style="display:none;"></iframe>
+  <iframe id="preview-frame"></iframe>
 </main>
+
 <script>
 /* ========== 配置与状态 ========== */
 const iframe = document.getElementById('preview-frame');
-const emptyDiv = document.getElementById('empty');
 const loadingIndicator = document.getElementById('loading-indicator');
 let currentXml = '';
 let renderTimer = null;
 let isIframeReady = false;
 
+// 定义系统提示词
+const SYSTEM_PROMPT = "你是一位经验丰富的原生drawio XML编写助手。请以下面的格式提供代码，所有代码都需要放在一个 XML 代码块中：\n```xml\n这里是 drawio XML 代码\n```";
+
+// 【核心修改】使用纯文本 XML，避免 Zlib 解压报错
+const BLANK_XML = `
+<mxfile host="Embed">
+  <diagram name="Page-1">
+    <mxGraphModel dx="1000" dy="1000" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="827" pageHeight="1169" math="0" shadow="0">
+      <root>
+        <mxCell id="0"/>
+        <mxCell id="1" parent="0"/>
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>
+`;
+
 // 初始化 URL
 const drawioUrl = 'https://embed.diagrams.net/?embed=1&ui=atlas&spin=1&modify=1&proto=json&noSaveBtn=1&libraries=1';
 
-/* ========== 核心: XML 清洗与修复 ========== */
+/* ========== XML 清洗与修复 ========== */
 
-/**
- * 修复 AI 生成的烂 XML
- * 1. 移除没有 'as' 属性的 mxPoint (这是导致报错的核心原因)
- * 2. 修复非法的数字属性 (如 height="X100" -> height="100")
- */
 function sanitizeDrawioXml(xmlStr) {
   try {
     const parser = new DOMParser();
     const doc = parser.parseFromString(xmlStr, "application/xml");
     
-    // 检查解析错误
     if (doc.querySelector('parsererror')) {
-      return xmlStr; // 无法解析，原样返回，让后续流程处理
+      return xmlStr;
     }
 
-    // --- 修复 1: 移除会导致 "Could not add object mxPoint" 的节点 ---
-    // 查找所有在 mxGeometry 下且没有 as 属性的 mxPoint
+    // 修复 1: 移除会导致错误的 mxPoint
     const badPoints = doc.querySelectorAll('mxGeometry > mxPoint:not([as])');
-    badPoints.forEach(el => {
-      // 移除这些坏点，让 Draw.io 自动计算连线
-      el.parentNode.removeChild(el);
-    });
+    badPoints.forEach(el => el.parentNode.removeChild(el));
 
-    // --- 修复 2: 清理非数字的尺寸属性 (可选优化) ---
-    // AI 经常输出 "X100", "1X0" 等
+    // 修复 2: 清理非数字属性
     const geometryNodes = doc.querySelectorAll('mxGeometry');
     ['width', 'height', 'x', 'y'].forEach(attr => {
       geometryNodes.forEach(node => {
         if (node.hasAttribute(attr)) {
           let val = node.getAttribute(attr);
-          // 如果包含非数字字符，尝试提取数字
           if (/[^0-9\.\-]/.test(val)) {
             const num = val.replace(/[^0-9\.\-]/g, '');
-            if (num) {
-              node.setAttribute(attr, num);
-            } else {
-              // 如果完全是乱码，设为默认值防止图形消失
-              node.setAttribute(attr, attr === 'x' || attr === 'y' ? '0' : '80');
-            }
+            node.setAttribute(attr, num || (attr === 'x' || attr === 'y' ? '0' : '80'));
           }
         }
       });
     });
 
-    // 重新序列化为字符串
     return new XMLSerializer().serializeToString(doc);
 
   } catch (e) {
     console.warn('XML清洗失败:', e);
-    return xmlStr; // 出错时返回原字符串
+    return xmlStr;
   }
 }
 
-/**
- * 验证 XML 字符串是否合法
- */
 function isValidXml(xmlStr) {
   if (!xmlStr || xmlStr.length < 50) return false;
+  // 必须包含关键标签
   if (!xmlStr.includes('<mxGraphModel') && !xmlStr.includes('<mxfile')) return false;
-  
-  // 简单验证闭合，防止流式输出未完成时报错
-  // 检查是否包含 mxfile 或 mxGraphModel 的闭合标签
-  if (!xmlStr.includes('</mxfile>') && !xmlStr.includes('</mxGraphModel>')) {
-     return false;
-  }
-  
+  // 必须闭合（简单判断）
+  if (!xmlStr.includes('</mxfile>') && !xmlStr.includes('</mxGraphModel>')) return false;
   return true;
 }
 
-/**
- * 提取 XML
- */
 function extractDrawioXml(text) {
   if (!text) return { xml: '', isComplete: false };
 
-  // 1. 寻找 XML 起始
   const roots = ['mxfile', 'mxGraphModel'];
   let startIndex = -1;
   let rootTag = '';
@@ -200,7 +149,6 @@ function extractDrawioXml(text) {
 
   if (startIndex === -1) return { xml: '', isComplete: false };
 
-  // 2. 寻找 XML 结束
   let xmlContent = text.substring(startIndex);
   const endTag = `</${rootTag}>`;
   const endTagIndex = xmlContent.indexOf(endTag);
@@ -211,7 +159,6 @@ function extractDrawioXml(text) {
     isComplete = true;
   }
 
-  // 3. 关键：在这里进行清洗
   if (isComplete) {
       xmlContent = sanitizeDrawioXml(xmlContent);
   }
@@ -219,8 +166,7 @@ function extractDrawioXml(text) {
   return { xml: xmlContent, isComplete: isComplete };
 }
 
-
-/* ========== 渲染逻辑 (保持不变) ========== */
+/* ========== 渲染逻辑 ========== */
 
 function showLoading(show) {
   loadingIndicator.style.display = show ? 'block' : 'none';
@@ -235,14 +181,15 @@ function initIframe() {
 function loadDiagram(xml) {
   if (!isIframeReady) return;
   
+  // 使用修正后的空 XML
+  const xmlToLoad = xml || BLANK_XML;
+
   iframe.contentWindow.postMessage(JSON.stringify({
     action: 'load', 
-    xml: xml,
+    xml: xmlToLoad,
     autosave: false 
   }), '*');
   
-  emptyDiv.style.display = 'none';
-  iframe.style.display = 'block';
   showLoading(false);
 }
 
@@ -251,13 +198,12 @@ function debouncedRender(xmlData) {
   
   if (!xmlData.xml) return;
   if (!isValidXml(xmlData.xml)) {
-    if (xmlData.xml.length > 50) showLoading(true); // 只有内容够长才显示加载中
+    if (xmlData.xml.length > 50) showLoading(true);
     return;
   }
   if (xmlData.xml === currentXml) return;
 
   renderTimer = setTimeout(() => {
-    console.log('执行渲染，XML长度:', xmlData.xml.length);
     currentXml = xmlData.xml;
     
     if (!isIframeReady) {
@@ -284,14 +230,17 @@ function renderPreview(list) {
   }
 }
 
-/* ========== WebSocket (保持不变) ========== */
+/* ========== WebSocket与初始化 ========== */
+
 window.addEventListener('message', function(event) {
   if (event.source !== iframe.contentWindow) return;
   try {
     const msg = JSON.parse(event.data);
+    
     if (msg.event === 'init') {
       isIframeReady = true;
-      if (currentXml && isValidXml(currentXml)) loadDiagram(currentXml);
+      // 这里的逻辑是：如果没有 currentXml (历史消息没提取到)，则加载 BLANK_XML
+      loadDiagram(currentXml || BLANK_XML);
     }
   } catch (e) {}
 });
@@ -306,6 +255,17 @@ function init() {
   
   ws.onopen = () => {
     reconnectAttempts = 0;
+    
+    // [新增功能] 发送系统提示词
+    console.log("Setting system prompt for Draw.io...");
+    ws.send(JSON.stringify({
+      type: 'set_system_prompt',
+      data: {
+        text: SYSTEM_PROMPT
+      }
+    }));
+
+    // 获取历史消息
     ws.send(JSON.stringify({type:'get_messages'}));
   };
   
